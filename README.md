@@ -27,6 +27,7 @@
 - [第 13 章：命令速查表](#第-13-章命令速查表)
 - [第 14 章：常见误操作与自救](#第-14-章常见误操作与自救)
 - [FAQ](#faq)
+- [附录 A：启动链故障排查与救援手册](#附录-a启动链故障排查与救援手册)
 - [仓库脚本与相关资源](#仓库脚本与相关资源)
 
 ---
@@ -1132,10 +1133,143 @@ sudo ./bench.sh
 - 🖥️ **VPS 评测与推荐**：[https://vpsvip.net](https://vpsvip.net)
 - 🚀 **网络加速方案**：[ClashVIP](https://clashvip.net)
 - 🧭 **工具资源导航**：[nav.clashvip.net](https://nav.clashvip.net)
+- 🧩 **教程与文档站**：[clash-for-windows.net](https://clash-for-windows.net)
+- 🌐 **资源聚合社区**：[clashhub.net](https://clashhub.net)
+- 💬 **社区讨论区**：[bbs.clashhub.net](https://bbs.clashhub.net)
 
 ### 关键词
 
 `Linux服务器教程` `VPS运维` `systemd` `sysctl调优` `BBR加速` `SSH加固` `nftables防火墙` `logrotate` `crontab` `故障排查` `内核参数` `Debian` `Ubuntu` `Rocky Linux` `服务器初始化` `运维手册`
+
+---
+
+## 附录 A：启动链故障排查与救援手册
+
+> 服务器最吓人的故障不是"服务挂了"，而是"机器起不来了"——SSH 连不上，前面 12 章的所有工具全都用不上。这一章讲启动链的每个环节会怎么坏、怎么判断坏在哪一环、怎么救回来。请在机器还健康的时候读完本章并准备好救援手段（VPS 控制台/VNC、救援 ISO、快照），出事之后再学就晚了。
+
+### A.1 启动链全景：坏在哪一环，症状不一样
+
+```
+固件(BIOS/UEFI) → 引导器(GRUB) → 内核(vmlinuz) → initramfs → systemd → 各类服务
+```
+
+| 症状 | 大概率坏点 | 判断依据 |
+|------|-----------|---------|
+| 黑屏，连控制台输出都没有 | 固件/引导器 | 控制台无任何输出 |
+| `GRUB>` 提示符或 `grub rescue>` | 引导器配置损坏 | 出现 GRUB 命令行 |
+| 内核 panic / 打印一屏日志后卡死 | 内核或驱动 | 控制台有 kernel panic 字样 |
+| `Emergency mode` / `Give root password` | initramfs 之后的挂载/文件系统 | 能进 emergency shell |
+| 启动慢但最终能进系统 | 某服务超时（常见：fstab 等网络盘） | 登录后 `systemd-analyze` 分析 |
+
+### A.2 平时就要做的三件准备工作
+
+```bash
+# 1. 持久化 journald 日志（默认 volatile，重启即失忆；救援排查全靠它回看上一次启动）
+mkdir -p /var/log/journal && systemd-tmpfiles --create --prefix /var/log/journal
+systemctl restart systemd-journald
+
+# 2. 记住当前内核与引导配置，升级前后各留一份
+uname -r && cat /boot/grub/grub.cfg > ~/grub.cfg.bak.$(date +%F)
+
+# 3. 确认 VPS 有救援模式/挂载 ISO 的能力，并做过一次快照恢复演练
+```
+
+### A.3 启动性能分析：先量化，再动手
+
+```bash
+systemd-analyze                    # 总耗时：firmware + loader + kernel + userspace
+systemd-analyze blame             # 每个服务耗时排序（注意是并行启动，简单求和无意义）
+systemd-analyze critical-chain    # 关键路径：真正拖慢开机的那条链
+systemd-analyze verify default.target   # 静态检查 unit 文件语法错误
+```
+
+**读法**：`blame` 里排第一的服务未必是罪魁——重点看 `critical-chain` 里带 `@` 和 `+` 的时间（`@` 是启动耗时，`+` 是该服务拖慢了后续服务的部分）。
+
+### A.4 案例一：开机卡住 90 秒才进系统
+
+**症状**：`critical-chain` 显示卡在 `network-online.target` 之后某个挂载点。
+
+**根因**：`/etc/fstab` 里写了一个已下线的外部 NFS/挂载源，每次启动 `systemd` 都要等网络超时。
+
+**修复**：
+
+```bash
+# 在 fstab 中给非关键挂载加 nofail 与短超时
+# 原行： 10.0.1.8:/backup  /mnt/backup  nfs  defaults  0 0
+# 改为： 10.0.1.8:/backup  /mnt/backup  nfs  defaults,nofail,x-systemd.device-timeout=5s  0 0
+
+mount -a          # 先验证 fstab 没写错（写错且无 nofail 下次重启直接进 emergency）
+systemctl daemon-reload
+```
+
+**教训**：任何改 fstab 的操作，改完立刻 `mount -a` 验证；关键系统盘挂载不要加 `nofail`（宁可起不来进救援，也不能带着缺盘的系统上线）。
+
+### A.5 案例二：内核升级后起不来
+
+**症状**：升级内核重启后 VPS 控制台显示 panic 或卡在 initramfs。
+
+**排查与救援**（以 GRUB 菜单可进为前提）：
+
+1. 重启进 GRUB 菜单 → 选 "Advanced options" → 启动**旧内核**（这正是保留旧内核的价值，不要清理 `/boot` 太狠）；
+2. 进系统后确认问题：
+
+```bash
+journalctl -b -1 --no-pager | tail -100     # 看失败那次启动的最后日志
+journalctl -b -1 -p err                     # 只看错误级
+```
+
+3. 常见根因与处理：
+   - **initramfs 缺驱动**：`update-initramfs -u -k <坏内核版本>` 重建；
+   - **`/boot` 满了导致安装半截**：`df -h /boot`，清理旧内核后 `apt install --reinstall linux-image-<版本>`；
+   - **GRUB 没刷新**：`update-grub`（Debian/Ubuntu）或 `grub2-mkconfig -o /boot/grub2/grub.cfg`（RHEL 系）。
+
+### A.6 案例三：GRUB 命令行救援（`grub rescue>`）
+
+ grub 核心文件位置变动（如分区调整）时会出现。救援口诀是 `ls` 找分区 → 手动定位 `/boot/grub` → 指定 prefix 和 root：
+
+```
+grub rescue> ls
+(hd0) (hd0,gpt2) (hd0,gpt1)
+grub rescue> ls (hd0,gpt2)/boot/grub        # 逐个试，找到能列出 grub 目录的分区
+grub rescue> set root=(hd0,gpt2)
+grub rescue> set prefix=(hd0,gpt2)/boot/grub
+grub rescue> insmod normal
+grub rescue> normal                          # 进入正常 GRUB 菜单，启动系统
+```
+
+进系统后必须**重装 GRUB** 才能持久化修复：
+
+```bash
+grub-install /dev/vda     # 注意是整盘不是分区；UEFI 机器用 grub-install --target=x86_64-efi
+update-grub
+```
+
+### A.7 终极手段：chroot 救援（机器完全进不去时）
+
+用 VPS 救援 ISO / 挂载 Live 系统启动，然后挂载原系统并 chroot 进去修：
+
+```bash
+# 假设原系统根分区是 /dev/vda1，EFI 分区 /dev/vda15（按 fdisk -l 实际调整）
+mount /dev/vda1 /mnt
+mount /dev/vda15 /mnt/boot/efi        # UEFI 机器
+for d in dev proc sys run; do mount --bind /$d /mnt/$d; done
+chroot /mnt
+# 现在就是在"原系统"里操作：重装内核、grub-install、改 fstab、改密码……
+update-grub && grub-install /dev/vda
+exit
+umount -R /mnt && reboot              # 拔掉救援介质再重启
+```
+
+**验证要点**：chroot 前 `mount --bind` 四件套缺一不可，否则 apt/dpkg 会报 `/proc` 相关的诡异错误。
+
+### A.8 防呆清单（每台机器过一遍）
+
+- [ ] journald 已持久化（能看 `-b -1` 的历史）
+- [ ] `/boot` 使用率 < 50%，保留至少 1 个旧内核
+- [ ] fstab 非关键挂载全部带 `nofail`，且改后 `mount -a` 验证过
+- [ ] 会用 VPS 控制台/VNC，知道救援模式入口
+- [ ] 有最近 7 天内的快照，且做过一次恢复演练
+- [ ] 内核升级安排在低峰期，升级后 10 分钟内人工确认服务健康
 
 ---
 
@@ -1147,4 +1281,4 @@ sudo ./bench.sh
 
 ---
 
-*最后更新: 2026-08-10 | 维护者: clashforwindows-net | 推荐: [VPSVIP](https://vpsvip.net)*
+*最后更新: 2026-11-06 | 维护者: clashforwindows-net | 推荐: [VPSVIP](https://vpsvip.net)*
